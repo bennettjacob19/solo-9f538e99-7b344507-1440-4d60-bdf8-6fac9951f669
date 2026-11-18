@@ -5,18 +5,21 @@ Usage::
 
     python examples/demo.py [BASE_URL]
 
-Covers the three scenarios reviewers care about:
+Covers the four scenarios reviewers care about:
 
 1. normal inference, then a successful hot swap;
 2. a failed candidate load (old version keeps serving);
 3. slow inference with a client timeout, followed by a swap and a third
-   upload that is refused until the slow work finishes and the slot is freed.
+   upload that is refused until the slow work finishes and the slot is freed;
+4. emergency quarantine of the stuck draining version, the explicit failure of
+   its stuck caller, and the next version loading into the freed slot.
 """
 
 from __future__ import annotations
 
 import json
 import sys
+import threading
 import time
 
 import httpx
@@ -101,6 +104,41 @@ def main() -> int:
             break
         time.sleep(0.5)
     show("upload v4 now", client.post("/admin/models", json=artifact("v4", W2)))
+    slots()
+
+    print("\n== 6. emergency quarantine of a stuck draining version ==")
+    stuck_version = "v4"
+    retired = f"v5-{int(time.time())}"
+    # A long-running request keeps the current version's in-flight count up.
+    holder = {}
+
+    def slow_call():
+        holder["r"] = client.post(
+            "/infer", json={"features": FEATURES, "slow_ms": 20000, "timeout_ms": 60000}
+        )
+
+    thread = threading.Thread(target=slow_call)
+    thread.start()
+    time.sleep(0.5)
+    show("upload v5 while v4 is busy", client.post("/admin/models", json=artifact(retired, W1)))
+    st = slots()
+    print(f"  v4 still draining with in-flight work: {st['total_in_flight']}")
+    show(
+        "quarantine the active (must be 409)",
+        client.post(f"/admin/models/{retired}/quarantine", json={}),
+    )
+    show(
+        "quarantine stuck v4",
+        client.post(
+            f"/admin/models/{stuck_version}/quarantine",
+            json={"reason": "demo: stuck inference"},
+        ),
+    )
+    thread.join(timeout=30)
+    show("stuck caller is now failed explicitly", holder["r"])
+    slots()
+    show("upload next version into freed slot", client.post("/admin/models", json=artifact("v6", W2)))
+    show("infer (v6)", client.post("/infer", json={"features": FEATURES}))
     slots()
     return 0
 

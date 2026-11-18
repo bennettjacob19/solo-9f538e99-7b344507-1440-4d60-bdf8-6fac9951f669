@@ -8,6 +8,8 @@ running a third model process.
 ```
 POST /infer           classify a feature vector (with optional client timeout)
 POST /admin/models    upload weights/bias/labels and hot-swap the model in
+POST /admin/models/{version}/quarantine
+                      emergency-isolate a draining version
 GET  /admin/versions  version registry
 GET  /admin/status    active version, in-flight counts, per-process state
 GET  /healthz         liveness
@@ -66,6 +68,51 @@ else is rejected with 422 before a process is started.
 | `slow_load_ms` | demo: delay worker readiness to watch the old version serve |
 | `simulate_load_failure` | demo: make the new worker report a load failure |
 
+## Emergency quarantine of a draining version
+
+When an old version's inference wedges, the machine can be left with both
+slots occupied and the next version unable to load. `POST
+/admin/models/{version}/quarantine` is the emergency override:
+
+```json
+{"reason": "stuck inference", "simulate_stop_failure": false}
+```
+
+* **Only a draining version.** The version must already have been retired by a
+  successful swap (`state: "retired"`, slot `draining`). The active version
+  returns **409 `not_quarantinable`** and keeps serving; unknown ids return
+  **404**. A still-loading candidate cannot be quarantined either.
+* **Outstanding work fails explicitly.** Every request accepted by that version
+  and not yet returned is settled as `quarantined` and its caller gets **409
+  `request_quarantined`** (with `version` and `reason`). It no longer hangs
+  until some client timeout.
+* **Exactly-once settlement.** Each request has a settlement token, recorded
+  with the slot generation it was admitted under. A worker response that
+  arrives after the quarantine is a *late completion*: it never settles the
+  request twice, and if the slot has been reused by a newer version the
+  generation check makes it a no-op, so the new process's counters are never
+  touched. A concurrent normal completion and quarantine race also settles
+  once: the token decides.
+* **The slot stays occupied until the process is really gone.** The quarantine
+  sends SIGTERM/SIGKILL to the old process group and waits for the actual exit
+  (bounded by `QUARANTINE_STOP_SECONDS`). Only then is the slot released; a
+  status query in between shows `quarantine_state: "pending"` and the slot
+  still in use. The next version can only be loaded after that exit.
+* **Failure is never reported as free capacity.** With
+  `simulate_stop_failure: true` (or if the process cannot be confirmed gone)
+  the endpoint returns **503 `quarantine_stop_failed`**, the provisional
+  abandonment is withdrawn, the slot stays occupied, and the normal drain keeps
+  waiting for the in-flight work's real completion. Requests whose worker
+  response arrives during the failed window still complete normally (200),
+  counted once.
+* **Normal drain is unchanged.** If the work finishes on its own, the drain
+  loop releases the slot exactly as before; the quarantine is then a no-op
+  (`already: true`, `abandoned_work: 0`).
+* **Status shows the outcome.** `GET /admin/status` reports
+  `quarantined_versions` (`state`: `pending` / `released` / `failed`, reason,
+  timestamp, abandoned count), per-slot `quarantine_state` / `abandoned`, and
+  `total_abandoned`.
+
 ## The guarantees and how they are enforced
 
 Each version runs in **its own OS process** (`python -m app.worker_launcher`,
@@ -115,7 +162,6 @@ Two fixed slots, `slot-0` and `slot-1`, are the two-process budget.
 * **Crashed workers are reclaimed.** If a worker dies unexpectedly, its slot
   is released and, if it was active, the service reports 503 (no active model)
   rather than routing to a dead process.
-
 ## Demo scenarios
 
 1. **Normal swap.** Upload `examples/models/v1.json`, infer, upload `v2`,
@@ -129,8 +175,15 @@ Two fixed slots, `slot-0` and `slot-1`, are the two-process budget.
    becomes active and the slow version goes `draining`. A third upload returns
    429 while the slow computation still runs. After it finishes the slot is
    released and the upload succeeds.
+4. **Emergency quarantine.** While that version is `draining` with
+   `in_flight: 1`, `POST /admin/models/<old>/quarantine` returns 200 with
+   `abandoned_work: 1` and frees the slot after the process exits; the slow
+   caller gets 409 `request_quarantined`, and the next version loads. Add
+   `"simulate_stop_failure": true` to see the 503 path: the slot stays
+   occupied, the active version keeps serving, and the slow caller still
+   completes normally.
 
-`python examples/demo.py <base-url>` runs all three end to end.
+`python examples/demo.py <base-url>` runs all four end to end.
 
 ## Observations from the smoke runs
 
@@ -152,7 +205,8 @@ app/
   models.py           artifact validation, NumPy scoring
 tests/
   test_models.py          artifact validation + scoring
-  test_registry.py        state machine, claims, drain gate, crash reclaim
+  test_registry.py        state machine, claims, drain gate, crash reclaim,
+                          quarantine settlement / generation guards
   test_api_integration.py real API + real worker processes
 examples/
   demo.py, models/*.json
@@ -165,6 +219,7 @@ examples/
 | `DATA_DIR` | `/data` | models, staging, worker control dirs, instance lock |
 | `DEFAULT_INFER_TIMEOUT_MS` | `5000` | client wait when `timeout_ms` is omitted |
 | `SWAP_WAIT_SECONDS` | `3` | how long an upload waits for a draining slot before 429 |
+| `QUARANTINE_STOP_SECONDS` | `10` | how long an emergency quarantine waits for the old process to exit |
 | `SHUTDOWN_GRACE_SECONDS` | `20` | how long shutdown waits for in-flight work |
 | `BOOTSTRAP_VERSION` / `BOOTSTRAP_MODEL` | unset | optionally load one artifact at startup |
 | `LOG_LEVEL` | `INFO` | logging |

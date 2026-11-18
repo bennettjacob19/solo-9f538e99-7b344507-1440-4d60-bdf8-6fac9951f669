@@ -373,3 +373,211 @@ def test_12_no_model_after_shutdown(api):
     assert httpx.get(f"{api.base}/healthz", timeout=5).status_code == 200
     assert httpx.get(f"{api.base}/docs", timeout=5).status_code == 200
     assert httpx.get(f"{api.base}/openapi.json", timeout=5).status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Emergency quarantine of a draining version
+# ---------------------------------------------------------------------------
+
+
+def _retire_with_slow_work(api: ApiServer, old: str, new: str, slow_ms: int = 8000):
+    """Start a slow request on ``old`` and swap to ``new`` while it runs.
+
+    Returns ``(worker_thread, response_holder)``.  ``old`` is left draining
+    with one in-flight request held by real work in its process.
+    """
+    import threading
+
+    holder: dict = {}
+
+    def slow_call():
+        holder["r"] = httpx.post(
+            f"{api.base}/infer",
+            json={"features": [0.9, 0.1], "slow_ms": slow_ms, "timeout_ms": 60_000},
+            timeout=90.0,
+        )
+
+    t = threading.Thread(target=slow_call)
+    t.start()
+    wait_for(lambda: status(api)["total_in_flight"] >= 1, timeout=5)
+    resp = upload(api, artifact(new, W_B, [0.0, 0.0], LABELS))
+    assert resp.status_code == 201, resp.text
+    st = status(api)
+    assert st["active_version"] == new
+    old_info = next(v for v in st["versions"] if v["version"] == old)
+    assert old_info["state"] == "retired"
+    return t, holder
+
+
+def test_13_quarantine_rejects_active_version(api):
+    active = status(api)["active_version"]
+    resp = httpx.post(f"{api.base}/admin/models/{active}/quarantine", json={}, timeout=10)
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["error"] == "not_quarantinable"
+    st = status(api)
+    assert st["active_version"] == active
+    assert infer(api, [0.9, 0.1]).status_code == 200
+
+
+def test_14_quarantine_unknown_version(api):
+    resp = httpx.post(f"{api.base}/admin/models/nope-{uuid.uuid4().hex}/quarantine", json={})
+    assert resp.status_code == 404
+    assert resp.json()["detail"]["error"] == "unknown_version"
+
+
+def test_15_quarantine_fails_work_explicitly_and_releases_after_exit(api):
+    wait_for(lambda: status(api)["slots_in_use"] == 1, timeout=15)
+    old = status(api)["active_version"]
+    new = f"q-{uuid.uuid4().hex[:6]}"
+    worker, holder = _retire_with_slow_work(api, old, new)
+
+    st = status(api)
+    assert st["slots_in_use"] == 2
+    assert st["total_in_flight"] == 1
+    old_slot_before = next(s for s in st["slots"] if s["version"] == old)
+
+    resp = httpx.post(
+        f"{api.base}/admin/models/{old}/quarantine",
+        json={"reason": "stuck inference"},
+        timeout=30,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["quarantine_state"] == "released"
+    assert body["abandoned_work"] == 1
+    assert body["slot_released"] is True
+    assert body["process_exited"] is True
+    assert body["active_version"] == new
+
+    # The waiting request now fails explicitly instead of hanging.
+    worker.join(timeout=30)
+    assert not worker.is_alive()
+    assert holder["r"].status_code == 409, holder["r"].text
+    detail = holder["r"].json()["detail"]
+    assert detail["error"] == "request_quarantined"
+    assert detail["version"] == old
+
+    # The slot is free and the active version is untouched.
+    st = status(api)
+    assert st["active_version"] == new
+    assert st["slots_in_use"] == 1
+    assert st["total_in_flight"] == 0
+    q = next(v for v in st["quarantined_versions"] if v["version"] == old)
+    assert q["state"] == "released"
+    assert q["reason"] == "stuck inference"
+    assert q["abandoned_work"] == 1
+    assert old_slot_before["completed"] <= st["total_completed"]
+    assert infer(api, [0.9, 0.1]).json()["version"] == new
+
+
+def test_16_next_version_loads_after_quarantine(api):
+    nxt = f"n-{uuid.uuid4().hex[:6]}"
+    resp = upload(api, artifact(nxt, W_A, [0.0, 0.0], LABELS))
+    assert resp.status_code == 201, resp.text
+    assert status(api)["active_version"] == nxt
+
+
+def test_17_failed_quarantine_does_not_fake_free_slot(api):
+    wait_for(lambda: status(api)["slots_in_use"] == 1, timeout=15)
+    old = status(api)["active_version"]
+    new = f"f-{uuid.uuid4().hex[:6]}"
+    worker, holder = _retire_with_slow_work(api, old, new, slow_ms=4000)
+    baseline = next(s for s in status(api)["slots"] if s["version"] == old)
+    baseline_completed = baseline["completed"]
+    baseline_abandoned = baseline["abandoned"]
+
+    resp = httpx.post(
+        f"{api.base}/admin/models/{old}/quarantine",
+        json={"reason": "attempt", "simulate_stop_failure": True},
+        timeout=30,
+    )
+    assert resp.status_code == 503, resp.text
+    detail = resp.json()["detail"]
+    assert detail["error"] == "quarantine_stop_failed"
+    assert detail["quarantine_state"] == "failed"
+    assert detail["in_flight"] == 1
+    assert detail["active_version"] == new
+
+    # Not reported as free: both slots still occupied, the real work is still
+    # running, and a third upload is refused.
+    st = status(api)
+    assert st["slots_in_use"] == 2
+    assert st["total_in_flight"] == 1
+    assert next(
+        s for s in st["slots"] if s["version"] == old
+    )["quarantine_state"] == "failed"
+    third = upload(api, artifact(f"t-{uuid.uuid4().hex[:6]}", W_A, [0.0, 0.0], LABELS))
+    assert third.status_code == 429, third.text
+
+    # The active version keeps serving throughout.
+    assert infer(api, [0.9, 0.1]).json()["version"] == new
+
+    # The untouched request completes normally (200) exactly once, and only
+    # then is the slot released by the ordinary drain.  The counters before
+    # the failed quarantine are the baseline; the request must add exactly one
+    # completion and no abandonment.
+    worker.join(timeout=30)
+    assert holder["r"].status_code == 200, holder["r"].text
+    assert holder["r"].json()["version"] == old
+    wait_for(lambda: status(api)["slots_in_use"] == 1, timeout=15)
+    st = status(api)
+    assert st["total_in_flight"] == 0
+    old_slot = next(s for s in st["slots"] if s["version"] is None)
+    assert old_slot["completed"] == baseline_completed + 1
+    assert old_slot["abandoned"] == baseline_abandoned
+
+
+def test_18_concurrent_quarantine_settles_once(api):
+    wait_for(lambda: status(api)["slots_in_use"] == 1, timeout=15)
+    old = status(api)["active_version"]
+    new = f"c-{uuid.uuid4().hex[:6]}"
+    worker, holder = _retire_with_slow_work(api, old, new, slow_ms=5000)
+    baseline = next(s for s in status(api)["slots"] if s["version"] == old)
+    baseline_completed = baseline["completed"]
+    import threading
+
+    codes = []
+    bodies = []
+
+    def go():
+        r = httpx.post(
+            f"{api.base}/admin/models/{old}/quarantine", json={}, timeout=30
+        )
+        codes.append(r.status_code)
+        if r.status_code == 200:
+            bodies.append(r.json())
+
+    threads = [threading.Thread(target=go) for _ in range(2)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert codes.count(200) >= 1, codes
+    total_abandoned = sum(b["abandoned_work"] for b in bodies)
+    assert total_abandoned == 1, bodies  # not double-counted
+
+    worker.join(timeout=30)
+    assert holder["r"].status_code == 409
+    st = status(api)
+    assert st["total_in_flight"] == 0
+    assert st["slots_in_use"] == 1
+    slot = next(s for s in st["slots"] if s["version"] is None)
+    assert slot["abandoned"] == 1
+    # The late worker response was discarded: no extra completion.
+    assert slot["completed"] == baseline_completed
+
+
+def test_19_quarantine_refuses_already_drained_version(api):
+    """A fully drained (idle) version has no stuck work; quarantine is refused."""
+    wait_for(lambda: status(api)["slots_in_use"] == 1, timeout=15)
+    active = status(api)["active_version"]
+    retired_ids = [
+        v["version"]
+        for v in status(api)["versions"]
+        if v["state"] == "retired" and v["process_state"] == "idle"
+    ]
+    assert retired_ids, status(api)["versions"]
+    resp = httpx.post(
+        f"{api.base}/admin/models/{retired_ids[-1]}/quarantine", json={}, timeout=10
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["error"] == "not_quarantinable"
+    assert status(api)["active_version"] == active

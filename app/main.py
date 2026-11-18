@@ -4,6 +4,8 @@ Public surface (see ``/docs``):
 
 * ``POST /infer``            -- classify a feature vector with a client timeout
 * ``POST /admin/models``     -- upload a classifier artifact and hot-swap it in
+* ``POST /admin/models/{version}/quarantine``
+                             -- emergency-isolate a draining version
 * ``GET  /admin/versions``   -- version registry
 * ``GET  /admin/status``     -- active version, in-flight counts, process states
 * ``GET  /healthz``          -- liveness
@@ -35,6 +37,9 @@ from pydantic import BaseModel, Field, field_validator
 
 from app.models import ModelValidationError, load_model, save_artifact, validate_artifact
 from app.process_manager import (
+    QUARANTINE_NONE,
+    QUARANTINE_PENDING,
+    QUARANTINE_RELEASED,
     STATE_DRAINING,
     STATE_IDLE,
     VERSION_ACTIVE,
@@ -44,8 +49,10 @@ from app.process_manager import (
     FeatureMismatch,
     NoActiveModel,
     NoCapacity,
+    QuarantineConflict,
     Registry,
     SwapConflict,
+    UnknownVersion,
     WorkerHandle,
 )
 
@@ -66,6 +73,24 @@ MAX_TIMEOUT_MS = 600_000
 SWAP_WAIT_SECONDS = float(os.environ.get("SWAP_WAIT_SECONDS", "3"))
 # How long shutdown waits for accepted inference to finish before killing workers.
 SHUTDOWN_GRACE_SECONDS = float(os.environ.get("SHUTDOWN_GRACE_SECONDS", "20"))
+# How long an emergency quarantine waits for the old process to actually exit
+# before it gives up and reports that the slot is still occupied.
+QUARANTINE_STOP_SECONDS = float(os.environ.get("QUARANTINE_STOP_SECONDS", "10"))
+
+
+class RequestQuarantined(RuntimeError):
+    """The request was accepted, then explicitly abandoned by a quarantine.
+
+    Raised inside the API after the shared registry has settled the request as
+    ``quarantined``.  The worker call is deliberately not cancelled: it will
+    settle as a late completion and is ignored by the accounting.
+    """
+
+    def __init__(self, version: str, inference_id: str, reason: Optional[str]) -> None:
+        super().__init__(reason or "version was quarantined")
+        self.version = version
+        self.inference_id = inference_id
+        self.reason = reason
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +186,8 @@ class SlotView(BaseModel):
     in_flight: int
     accepted: int
     completed: int
+    abandoned: int = 0
+    quarantine_state: str = QUARANTINE_NONE
     alive: Optional[bool]
 
 
@@ -170,10 +197,42 @@ class StatusView(BaseModel):
     total_in_flight: int
     total_accepted: int
     total_completed: int
+    total_abandoned: int = 0
     slots_in_use: int
     capacity: int
     slots: List[SlotView]
     versions: List[Dict[str, Any]]
+    quarantined_versions: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class QuarantineRequest(BaseModel):
+    reason: Optional[str] = Field(
+        None,
+        max_length=500,
+        description="Operator note recorded with the quarantine.",
+    )
+    simulate_stop_failure: bool = Field(
+        False,
+        description=(
+            "Demo hook: pretend the old process could not be confirmed stopped. "
+            "The quarantine then reports failure, frees nothing, and the normal "
+            "drain keeps waiting for the real completion."
+        ),
+    )
+
+
+class QuarantineResult(BaseModel):
+    version: str
+    slot_id: str
+    quarantine_state: str
+    reason: Optional[str]
+    quarantined_at: float
+    abandoned_work: int
+    in_flight: int
+    slot_released: bool
+    process_exited: bool
+    active_version: Optional[str]
+    message: str
 
 
 class SwapResult(BaseModel):
@@ -202,8 +261,15 @@ class InferenceService:
         self._drain_task: Optional[asyncio.Task] = None
         self._closing = False
         self._draining: set[str] = set()
+        self._quarantining: set[str] = set()
         self._background: set[asyncio.Task] = set()
+        # Per-request settlement events, keyed by the registry work token.
+        self._work_events: Dict[str, asyncio.Event] = {}
         self._swap_lock = asyncio.Lock()  # serialises swaps inside this process
+        # Serialises the "stop the old process" step between the normal drain
+        # loop and the emergency quarantine, so only one of them can decide the
+        # slot's fate at a time.
+        self._lifecycle_lock = asyncio.Lock()
         self._lock_file: Any = None
 
     # -- lifecycle -------------------------------------------------------
@@ -577,20 +643,39 @@ class InferenceService:
             if version in self._draining:
                 continue
             # The drain gate: only stop the process once no accepted request
-            # is still running inside it.
-            if self.registry.version_in_flight(version) > 0:
+            # is still running inside it.  A version quarantined while its
+            # process was still alive releases here as soon as the process is
+            # actually observed gone -- never on intent alone.
+            if self.registry.version_in_flight(version) > 0 and not (
+                info.get("quarantine_state") == QUARANTINE_PENDING
+                and handle is not None
+                and not handle.alive()
+            ):
                 continue
             self._draining.add(version)
             try:
-                if handle is not None:
-                    await asyncio.to_thread(handle.stop, 10.0)
-                    await asyncio.to_thread(handle.wait_exit, 10.0)
-                released = self.registry.release_slot(
-                    slot["slot_id"], version, process_exited=True
-                )
-                if released:
-                    self.handles.pop(version, None)
-                    logger.info("drained %s; slot %s released", version, slot["slot_id"])
+                # Serialise the stop/release decision with the emergency
+                # quarantine so exactly one of them decides the slot's fate.
+                async with self._lifecycle_lock:
+                    handle = self.handles.get(version)
+                    exited = True
+                    if handle is not None:
+                        await asyncio.to_thread(handle.stop, 10.0)
+                        exited = await asyncio.to_thread(handle.wait_exit, 10.0)
+                    if not exited:
+                        logger.warning(
+                            "worker %s still running after stop; slot kept occupied",
+                            version,
+                        )
+                        continue
+                    released = self.registry.release_slot(
+                        slot["slot_id"], version, process_exited=True
+                    )
+                    if released:
+                        self.handles.pop(version, None)
+                        logger.info(
+                            "drained %s; slot %s released", version, slot["slot_id"]
+                        )
             except Exception:
                 logger.exception("failed to drain %s", version)
             finally:
@@ -599,6 +684,9 @@ class InferenceService:
     def _reap_dead_worker(self, version: str, info: Dict[str, Any]) -> None:
         """Reclaim bookkeeping for a worker process that died unexpectedly."""
         self.handles.pop(version, None)
+        # Wake anyone waiting on this version so they observe the settlement
+        # (or retry) instead of sitting until the client timeout.
+        self._wake_work_waiters(version)
         if info["state"] in (VERSION_ACTIVE, VERSION_LOADING):
             self.registry.settle_dead_worker(version)
             if self.registry.fail_active(version, "worker process exited unexpectedly"):
@@ -608,12 +696,183 @@ class InferenceService:
             with contextlib.suppress(Exception):
                 self.registry.release_slot(info["slot_id"], version, process_exited=True)
 
+    # -- emergency quarantine -------------------------------------------
+    async def quarantine_version(
+        self,
+        version: str,
+        reason: Optional[str],
+        simulate_stop_failure: bool = False,
+    ) -> QuarantineResult:
+        """Explicitly fail a draining version's outstanding work and stop it.
+
+        * Only a draining (retired) version may be quarantined; the active
+          version keeps serving and is never touched.
+        * Every open work item of that version is settled once, as
+          ``quarantined``, so waiting callers fail with an explicit 409 rather
+          than silently hanging.
+        * Callers are only woken once the emergency stop is confirmed.  If the
+          process cannot be confirmed gone the quarantine is reported as
+          failed, the accounting reverts to normal drain semantics, and the
+          slot stays occupied: the active version keeps serving and the normal
+          drain still waits for the real completion.
+        * The slot is released only after the OS process exit is confirmed.
+        """
+        note = (reason or "").strip() or "emergency quarantine requested by operator"
+        async with self._lifecycle_lock:
+            try:
+                record = self.registry.begin_quarantine(version, note)
+            except UnknownVersion as exc:
+                raise HTTPException(
+                    status_code=404,
+                    detail={"error": "unknown_version", "message": str(exc)},
+                ) from exc
+            except QuarantineConflict as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "not_quarantinable",
+                        "message": str(exc),
+                        "active_version": self.registry.active_version(),
+                    },
+                ) from exc
+
+            if record.get("already"):
+                for token in record.get("abandoned_tokens", []):
+                    event = self._work_events.get(token)
+                    if event is not None:
+                        event.set()
+                info = self.registry.version_info(version) or {}
+                message = (
+                    "version was already quarantined; slot "
+                    + (
+                        "has been released"
+                        if record["quarantine_state"] != QUARANTINE_PENDING
+                        else "is still occupied pending confirmed process exit"
+                    )
+                )
+                return QuarantineResult(
+                    version=version,
+                    slot_id=record["slot_id"],
+                    quarantine_state=record["quarantine_state"],
+                    reason=record.get("reason"),
+                    quarantined_at=float(record.get("quarantined_at") or time.time()),
+                    abandoned_work=record["abandoned_work"],
+                    in_flight=record["in_flight"],
+                    slot_released=info.get("process_state") == STATE_IDLE,
+                    process_exited=info.get("process_state") == STATE_IDLE,
+                    active_version=self.registry.active_version(),
+                    message=message,
+                )
+
+            handle = self.handles.pop(version, None)
+            exited = False
+            stop_error: Optional[str] = None
+            if handle is not None and not simulate_stop_failure:
+                try:
+                    await asyncio.to_thread(handle.stop, QUARANTINE_STOP_SECONDS)
+                    exited = await asyncio.to_thread(
+                        handle.wait_exit, QUARANTINE_STOP_SECONDS
+                    )
+                except Exception as exc:  # pragma: no cover - defensive
+                    stop_error = f"{type(exc).__name__}: {exc}"
+                    logger.exception("emergency stop of %s failed", version)
+            if not exited:
+                if handle is not None:
+                    # Put the handle back so the drain loop can keep watching
+                    # (and retry stopping) the still-live process.
+                    self.handles[version] = handle
+                failure = stop_error or (
+                    "simulated emergency-stop failure (simulate_stop_failure=true)"
+                    if simulate_stop_failure
+                    else "old process did not exit within "
+                    f"{QUARANTINE_STOP_SECONDS:.1f}s"
+                )
+                aborted = self.registry.abort_quarantine(version, failure)
+                # Wake any waiters so they re-check: the emergency settlement is
+                # withdrawn and they continue waiting for the real completion
+                # unless their worker call already returned (then it is counted
+                # once and the caller receives that result).
+                for token in record.get("abandoned_tokens", []):
+                    outcome = self.registry.work_outcome(token) or {}
+                    event = self._work_events.get(token)
+                    if event is not None:
+                        event.set()
+                    if outcome.get("outcome") == "completed":
+                        logger.info(
+                            "late worker completion for %s settled normally after "
+                            "failed quarantine",
+                            token,
+                        )
+                info = self.registry.version_info(version) or {}
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "error": "quarantine_stop_failed",
+                        "version": version,
+                        "slot_id": record["slot_id"],
+                        "message": (
+                            "emergency stop of the old process could not be "
+                            "confirmed; the slot remains occupied and the normal "
+                            "drain still waits for the real completion"
+                        ),
+                        "reason": failure,
+                        "quarantine_state": info.get("quarantine_state"),
+                        "in_flight": aborted.get("in_flight", 0),
+                        "active_version": self.registry.active_version(),
+                    },
+                )
+
+            # Confirmed exit: callers that were settled by the quarantine can
+            # now be told explicitly, then the slot is released.
+            for token in record.get("abandoned_tokens", []):
+                event = self._work_events.get(token)
+                if event is not None:
+                    event.set()
+            released = self.registry.release_slot(
+                record["slot_id"], version, process_exited=True
+            )
+            self.registry.mark_quarantine_released(version)
+            info = self.registry.version_info(version) or {}
+            logger.warning(
+                "quarantined %s: abandoned=%d, slot %s released=%s",
+                version,
+                record["abandoned_work"],
+                record["slot_id"],
+                released,
+            )
+            return QuarantineResult(
+                version=version,
+                slot_id=record["slot_id"],
+                quarantine_state=info.get("quarantine_state", QUARANTINE_RELEASED),
+                reason=note,
+                quarantined_at=float(record.get("quarantined_at") or time.time()),
+                abandoned_work=record["abandoned_work"],
+                in_flight=0,
+                slot_released=released,
+                process_exited=True,
+                active_version=self.registry.active_version(),
+                message=(
+                    "version quarantined: outstanding requests failed explicitly "
+                    "and the old process has exited"
+                    if record["abandoned_work"]
+                    else "version quarantined: no outstanding work; process exited and slot released"
+                ),
+            )
+
+    def _wake_work_waiters(self, version: str) -> None:
+        """Signal in-API waiters of a version whose worker process died."""
+        for token, event in list(self._work_events.items()):
+            work = self.registry.work_outcome(token)
+            if work is not None and work["version"] == version:
+                event.set()
+
     # -- inference -------------------------------------------------------
     async def infer(
         self, features: List[float], timeout_ms: int, slow_ms: int = 0
     ) -> InferResponse:
+        token = uuid.uuid4().hex
         try:
-            version, _slot_id = self.registry.accept_work(len(features))
+            version, _slot_id = self.registry.accept_work(len(features), token=token)
         except FeatureMismatch as exc:
             raise HTTPException(
                 status_code=422,
@@ -633,7 +892,7 @@ class InferenceService:
 
         handle = self.handles.get(version)
         if handle is None:  # pragma: no cover - registry/handle invariant
-            self.registry.complete_work(version)
+            self.registry.complete_work(version, token)
             raise HTTPException(
                 status_code=503,
                 detail={"error": "worker_missing", "message": f"worker for {version} is gone"},
@@ -646,14 +905,19 @@ class InferenceService:
 
         # Shield the worker call from this request's timeout/cancellation.  The
         # in-flight counter must only clear when the model process is actually
-        # done; a 504 or disconnected client must not fake completion.
-        task = asyncio.create_task(self._proxy_inference(version, handle, payload))
+        # done; a 504 or disconnected client must not fake completion.  The
+        # settlement token also protects the counters of a reused slot from a
+        # late response belonging to an earlier generation.
+        task = asyncio.create_task(
+            self._proxy_inference(version, handle, payload, token, inference_id)
+        )
         self._background.add(task)
         task.add_done_callback(self._background.discard)
+        task.add_done_callback(self._consume_task_result)
 
         started = time.perf_counter()
         try:
-            result = await asyncio.wait_for(asyncio.shield(task), timeout_ms / 1000.0)
+            result = await self._await_inference(task, token, timeout_ms)
         except asyncio.TimeoutError:
             elapsed = (time.perf_counter() - started) * 1000.0
             logger.warning(
@@ -676,16 +940,51 @@ class InferenceService:
                     ),
                 },
             )
-        except httpx.HTTPError as exc:
+        except RequestQuarantined as exc:
             raise HTTPException(
-                status_code=502,
+                status_code=409,
                 detail={
-                    "error": "worker_unreachable",
-                    "version": version,
-                    "message": str(exc),
+                    "error": "request_quarantined",
+                    "version": exc.version,
+                    "inference_id": inference_id,
+                    "message": (
+                        "this request was accepted by a version that has since been "
+                        "quarantined; it will not produce a result"
+                    ),
+                    "reason": exc.reason,
+                    "active_version": self.registry.active_version(),
                 },
             ) from exc
-        except RuntimeError as exc:
+        except (httpx.HTTPError, RuntimeError) as exc:
+            # Killing the old process makes its open HTTP calls fail.  If the
+            # registry says the request was settled by the quarantine, report
+            # that explicit outcome rather than an opaque worker error.
+            work = self.registry.work_outcome(token) or {}
+            if work.get("outcome") == "quarantined":
+                info = self.registry.version_info(work.get("version", "")) or {}
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "request_quarantined",
+                        "version": work.get("version"),
+                        "inference_id": inference_id,
+                        "message": (
+                            "this request was accepted by a version that has since "
+                            "been quarantined; it will not produce a result"
+                        ),
+                        "reason": info.get("quarantine_reason"),
+                        "active_version": self.registry.active_version(),
+                    },
+                ) from exc
+            if isinstance(exc, httpx.HTTPError):
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "error": "worker_unreachable",
+                        "version": version,
+                        "message": str(exc),
+                    },
+                ) from exc
             raise HTTPException(
                 status_code=502,
                 detail={"error": "worker_error", "version": version, "message": str(exc)},
@@ -700,8 +999,90 @@ class InferenceService:
             elapsed_ms=round(elapsed, 3),
         )
 
+    @staticmethod
+    def _consume_task_result(task: asyncio.Task) -> None:
+        """Mark a background inference task's outcome as observed.
+
+        The request handler may have stopped waiting (504, quarantine, failed
+        stop), in which case nobody else retrieves the result.  Reading it here
+        keeps asyncio from logging "exception was never retrieved".
+        """
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            task.exception()
+
+    async def _await_inference(
+        self, task: asyncio.Task, token: str, timeout_ms: int
+    ) -> Dict[str, Any]:
+        """Wait for the worker result, the client timeout, or a quarantine.
+
+        A quarantine settles the request as ``quarantined`` in the shared
+        registry and sets the per-request event.  The worker task itself is
+        *not* cancelled -- it is shielded and will settle as a late completion
+        that the registry ignores.  Whichever of the three fires first wins, so
+        the request is settled exactly once.
+        """
+        event = asyncio.Event()
+        self._work_events[token] = event
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        try:
+            while True:
+                # The quarantine may have landed between admission and this
+                # await registering its event; the settlement record is
+                # authoritative, so check it before sleeping on the event.
+                work = self.registry.work_outcome(token) or {}
+                if work.get("outcome") == "quarantined":
+                    info = self.registry.version_info(work.get("version", "")) or {}
+                    raise RequestQuarantined(
+                        work.get("version", ""),
+                        token,
+                        info.get("quarantine_reason"),
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                waiter = asyncio.ensure_future(event.wait())
+                try:
+                    done, _pending = await asyncio.wait(
+                        {task, waiter},
+                        timeout=remaining,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    if not waiter.done():
+                        waiter.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await waiter
+                if task in done and waiter not in done:
+                    return task.result()
+                if waiter in done:
+                    work = self.registry.work_outcome(token) or {}
+                    if work.get("outcome") == "quarantined":
+                        # The request was explicitly abandoned.  Even if the
+                        # worker response arrived in the same tick, it is late
+                        # and is discarded; the request has been settled once.
+                        info = self.registry.version_info(work.get("version", "")) or {}
+                        raise RequestQuarantined(
+                            work.get("version", ""),
+                            token,
+                            info.get("quarantine_reason"),
+                        )
+                    if task.done():
+                        return task.result()
+                    # A worker death or a failed quarantine attempt: let the
+                    # task settle or surface its error before deciding.
+                    event.clear()
+                elif task in done:
+                    return task.result()
+        finally:
+            self._work_events.pop(token, None)
+
     async def _proxy_inference(
-        self, version: str, handle: WorkerHandle, payload: Dict[str, Any]
+        self,
+        version: str,
+        handle: WorkerHandle,
+        payload: Dict[str, Any],
+        token: str,
+        inference_id: str,
     ) -> Dict[str, Any]:
         try:
             assert self.client is not None
@@ -713,8 +1094,17 @@ class InferenceService:
             return resp.json()
         finally:
             # Runs once, when the worker call actually settles.  This is the
-            # only place a request leaves the drain gate.
-            self.registry.complete_work(version)
+            # only place a request leaves the drain gate.  If the request was
+            # already quarantined the registry treats this as a late completion
+            # and changes nothing; if the slot was reused for another version,
+            # the generation check makes it a no-op as well.
+            settled = self.registry.complete_work(version, token)
+            if not settled:
+                logger.info(
+                    "late/detached completion of %s on %s ignored by accounting",
+                    inference_id,
+                    version,
+                )
 
     # -- status ----------------------------------------------------------
     def status(self) -> StatusView:
@@ -723,6 +1113,8 @@ class InferenceService:
         total_in_flight = 0
         total_accepted = 0
         total_completed = 0
+        total_abandoned = 0
+        quarantined = []
         active = snapshot["active_version"]
         for slot in snapshot["slots"]:
             handle = self.handles.get(slot["version"]) if slot["version"] else None
@@ -730,6 +1122,7 @@ class InferenceService:
             total_in_flight += int(slot["in_flight"])
             total_accepted += int(slot["accepted"])
             total_completed += int(slot["completed"])
+            total_abandoned += int(slot.get("abandoned", 0))
             slots.append(
                 SlotView(
                     slot_id=slot["slot_id"],
@@ -739,21 +1132,37 @@ class InferenceService:
                     in_flight=int(slot["in_flight"]),
                     accepted=int(slot["accepted"]),
                     completed=int(slot["completed"]),
+                    abandoned=int(slot.get("abandoned", 0)),
+                    quarantine_state=slot.get("quarantine_state", QUARANTINE_NONE),
                     alive=alive,
                 )
             )
+        for version, info in snapshot["versions"].items():
+            if info.get("quarantine_state") != QUARANTINE_NONE:
+                quarantined.append(
+                    {
+                        "version": version,
+                        "state": info.get("quarantine_state"),
+                        "reason": info.get("quarantine_reason"),
+                        "quarantined_at": info.get("quarantined_at"),
+                        "abandoned_work": int(info.get("abandoned_work", 0) or 0),
+                        "slot_id": info.get("slot_id"),
+                    }
+                )
         return StatusView(
             active_version=active,
             version=active,
             total_in_flight=total_in_flight,
             total_accepted=total_accepted,
             total_completed=total_completed,
+            total_abandoned=total_abandoned,
             slots_in_use=snapshot["slots_in_use"],
             capacity=snapshot["capacity"],
             slots=slots,
             versions=sorted(
                 snapshot["versions"].values(), key=lambda v: v.get("created_at", 0)
             ),
+            quarantined_versions=quarantined,
         )
 
 
@@ -803,7 +1212,14 @@ app = FastAPI(
         "`timeout_seconds`) bounds the *client wait only*: on expiry you get 504 "
         "while the worker keeps working and keeps its slot.\n"
         "* `GET /admin/status` shows the active version, in-flight counts and each "
-        "process slot's state (`loading` / `active` / `draining` / `idle`).\n\n"
+        "process slot's state (`loading` / `active` / `draining` / `idle`), plus "
+        "any quarantined versions.\n"
+        "* `POST /admin/models/{version}/quarantine` emergency-isolates a "
+        "*draining* version: its outstanding requests fail explicitly (409), the "
+        "old process is stopped, and its slot is released only after the process "
+        "exit is confirmed. The active version is never touched. If the stop "
+        "cannot be confirmed you get 503 and the slot stays occupied for the "
+        "normal drain.\n\n"
         "**Demos**\n"
         "- Slow inference: `POST /infer` with `slow_ms: 3000`, `timeout_ms: 200`, "
         "then watch `/admin/status` and try uploading another version: while the "
@@ -811,7 +1227,11 @@ app = FastAPI(
         "- Load failure: upload with `simulate_load_failure: true` (or malformed "
         "weights). You get 502 and the old version remains active.\n"
         "- Capacity: trigger a slow in-flight request, swap once, then try a third "
-        "upload -> 429 until the slow work finishes and the slot is released."
+        "upload -> 429 until the slow work finishes and the slot is released.\n"
+        "- Quarantine: with the old version draining and `in_flight: 1`, POST to "
+        "`/admin/models/{old}/quarantine` -> 200, the stuck caller gets 409 "
+        "`request_quarantined`, the slot frees after the process exits and the "
+        "next version loads. Use `simulate_stop_failure: true` for the 503 path."
     ),
     lifespan=lifespan,
 )
@@ -899,6 +1319,45 @@ async def upload_model(payload: ModelUpload) -> SwapResult:
         with contextlib.suppress(FileNotFoundError):
             target.unlink()
     return result
+
+
+@app.post(
+    "/admin/models/{version}/quarantine",
+    response_model=QuarantineResult,
+    responses={
+        404: {"description": "Unknown version"},
+        409: {
+            "description": "Version is not a draining version (active / loading / already gone)"
+        },
+        503: {
+            "description": (
+                "Emergency stop of the old process could not be confirmed; the "
+                "slot stays occupied and the normal drain keeps waiting"
+            )
+        },
+    },
+    tags=["admin"],
+    summary="Emergency-isolate a draining version",
+)
+async def quarantine_version(
+    version: str, payload: Optional[QuarantineRequest] = None
+) -> QuarantineResult:
+    """Fail a draining version's outstanding work and stop its process.
+
+    Only a version that has already been retired (draining after a swap) can
+    be quarantined.  The in-service (active) version is never affected.
+    """
+    if not VERSION_RE.match(version):
+        raise HTTPException(
+            status_code=422,
+            detail="version must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+        )
+    body = payload or QuarantineRequest()
+    return await service.quarantine_version(
+        version,
+        body.reason,
+        simulate_stop_failure=body.simulate_stop_failure,
+    )
 
 
 @app.get("/admin/versions", tags=["admin"], summary="Version registry")

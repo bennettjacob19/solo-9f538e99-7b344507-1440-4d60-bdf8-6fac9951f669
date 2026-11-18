@@ -30,6 +30,13 @@ Rules encoded here:
   swap claiming the same old version while the first is still in progress is
   rejected before any process is started.  The API runs as a single process
   (enforced by a data-directory lock), so this one writer owns the budget.
+* ``begin_quarantine`` is the emergency override for a *draining* version
+  whose in-flight work is stuck.  It force-settles exactly the outstanding
+  work items of that version (each work item is settled at most once, keyed
+  by a per-request token and guarded by the slot generation) so their callers
+  fail explicitly.  It does **not** free the slot: the slot stays occupied
+  until the API has confirmed the OS process is gone.  A quarantined version
+  is never the active version, so in-service inference is untouched.
 """
 
 from __future__ import annotations
@@ -56,6 +63,15 @@ VERSION_ACTIVE = "active"
 VERSION_RETIRED = "retired"
 VERSION_FAILED = "failed"
 
+# Quarantine lifecycle of a version.  ``none`` -> normal.  ``pending`` means
+# the emergency settlement was recorded but the OS process has not been
+# confirmed gone yet (the slot is still occupied).  ``released`` means the
+# version was quarantined and its slot has since been freed.
+QUARANTINE_NONE = "none"
+QUARANTINE_PENDING = "pending"
+QUARANTINE_RELEASED = "released"
+QUARANTINE_FAILED = "failed"
+
 CLAIM_NONE = "__none__"
 
 
@@ -65,6 +81,14 @@ class NoCapacity(RuntimeError):
 
 class SwapConflict(RuntimeError):
     """The swap's old version is no longer current, or a swap is in progress."""
+
+
+class QuarantineConflict(RuntimeError):
+    """Quarantine was requested for something that is not a draining version."""
+
+
+class UnknownVersion(LookupError):
+    """The version id is not in the registry."""
 
 
 class NoActiveModel(RuntimeError):
@@ -89,6 +113,12 @@ class Registry:
         self._versions = manager.dict()
         self._slots = manager.dict()
         self._claims = manager.dict()
+        # One entry per accepted inference: {version, slot_id, generation,
+        # settled, outcome, accepted_at}.  Settlement is keyed by this token so
+        # a request can be settled exactly once even when the drain gate and an
+        # emergency quarantine race, or when a late worker response arrives
+        # after its version has been quarantined.
+        self._work = manager.dict()
         self._state = manager.dict({"active_version": None})
         now = time.time()
         for i in range(SLOT_COUNT):
@@ -101,9 +131,11 @@ class Registry:
                 "in_flight": 0,
                 "accepted": 0,
                 "completed": 0,
+                "abandoned": 0,
                 "started_at": None,
                 "idle_since": now,
                 "generation": 0,
+                "quarantine_state": QUARANTINE_NONE,
             }
 
     # ------------------------------------------------------------------
@@ -142,6 +174,12 @@ class Registry:
             if slot is None or slot["version"] != version:
                 return 0
             return int(slot["in_flight"])
+
+    def work_outcome(self, token: str) -> Optional[Dict[str, Any]]:
+        """Settlement record for an accepted request, if it exists."""
+        with self._lock:
+            work = self._work.get(token)
+            return dict(work) if work is not None else None
 
     def has_capacity(self) -> bool:
         with self._lock:
@@ -227,9 +265,11 @@ class Registry:
                 in_flight=0,
                 accepted=0,
                 completed=0,
+                abandoned=0,
                 started_at=now,
                 idle_since=None,
                 generation=slot["generation"] + 1,
+                quarantine_state=QUARANTINE_NONE,
             )
             self._slots[slot_id] = slot
             self._versions[version] = {
@@ -245,6 +285,10 @@ class Registry:
                 "error": None,
                 "attempt": attempt,
                 "previous_error": previous_error,
+                "quarantine_state": QUARANTINE_NONE,
+                "quarantine_reason": None,
+                "quarantined_at": None,
+                "abandoned_work": 0,
             }
             return slot_id
 
@@ -358,12 +402,18 @@ class Registry:
             self._state["active_version"] = version
             del self._claims[key]
 
-    def accept_work(self, n_features: Optional[int] = None) -> Tuple[str, str]:
+    def accept_work(
+        self, n_features: Optional[int] = None, token: Optional[str] = None
+    ) -> Tuple[str, str]:
         """Pin an inference to the active version and count it in-flight.
 
         With ``n_features`` the request is validated against the active
         version's input width inside the same critical section, so a rejected
         request never touches the in-flight counter.
+
+        ``token`` is the settlement key.  It records the slot generation the
+        request was admitted under, so a response that arrives after the slot
+        has been reused can never settle the *new* process's counters.
         """
         with self._lock:
             version = self._state["active_version"]
@@ -394,20 +444,265 @@ class Registry:
             slot["in_flight"] += 1
             slot["accepted"] += 1
             self._slots[info["slot_id"]] = slot
+            if token is not None:
+                self._work[token] = {
+                    "version": version,
+                    "slot_id": info["slot_id"],
+                    "generation": int(slot["generation"]),
+                    "settled": False,
+                    "outcome": None,
+                    "accepted_at": time.time(),
+                }
             return version, info["slot_id"]
 
-    def complete_work(self, version: str) -> None:
+    def complete_work(self, version: str, token: Optional[str] = None) -> bool:
+        """Settle an accepted request exactly once.
+
+        With ``token`` the settlement is conditional on the work item still
+        being open *and* the slot still belonging to the same version **and
+        generation**.  A late worker response for an already-quarantined
+        request is therefore a no-op, and can never decrement the counters of a
+        reused slot.  Returns True when this call performed the settlement.
+        """
+        with self._lock:
+            if token is not None:
+                work = self._work.get(token)
+                if work is None:
+                    return False
+                if work["settled"]:
+                    if work.get("outcome") == "quarantined":
+                        self._note_late_completion(version, token, work)
+                    return False
+                info = self._versions.get(version)
+                if info is None:
+                    return False
+                slot = self._slots.get(info["slot_id"])
+                if (
+                    slot is None
+                    or slot["version"] != version
+                    or int(slot["generation"]) != int(work["generation"])
+                ):
+                    # The slot was reused: nothing here may be mutated.
+                    return False
+                slot = dict(slot)
+                slot["in_flight"] = max(0, slot["in_flight"] - 1)
+                slot["completed"] += 1
+                self._slots[info["slot_id"]] = slot
+                work = dict(work)
+                work.update(
+                    settled=True,
+                    outcome="completed",
+                    settled_at=time.time(),
+                    late_completion=False,
+                )
+                self._work[token] = work
+                return True
+            return self._complete_unkeyed(version)
+
+    def _note_late_completion(
+        self, version: str, token: str, work: Dict[str, Any]
+    ) -> None:
+        """Flag a worker response that returned after its request was abandoned.
+
+        The caller was already failed by the quarantine, so the response must
+        not settle anything a second time.  If the slot is still owned by the
+        same version *and generation* the completion is recorded as pending so
+        that ``abort_quarantine`` can apply it exactly once if the emergency
+        stop fails; once the slot is released/reused it is a no-op.
+        """
+        info = self._versions.get(version)
+        if info is None:
+            return
+        slot = self._slots.get(info["slot_id"])
+        if (
+            slot is None
+            or slot["version"] != version
+            or int(slot["generation"]) != int(work["generation"])
+        ):
+            return
+        work = dict(work)
+        work["late_completion"] = True
+        work["late_completion_at"] = time.time()
+        self._work[token] = work
+
+    def _complete_unkeyed(self, version: str) -> bool:
+        info = self._versions.get(version)
+        if info is None:
+            return False
+        slot = self._slots.get(info["slot_id"])
+        if slot is None or slot["version"] != version:
+            return False
+        slot = dict(slot)
+        slot["in_flight"] = max(0, slot["in_flight"] - 1)
+        slot["completed"] += 1
+        self._slots[info["slot_id"]] = slot
+        return True
+
+    def begin_quarantine(self, version: str, reason: str) -> Dict[str, Any]:
+        """Emergency isolation of a draining version.
+
+        Only a ``retired`` version whose process is still ``draining`` may be
+        quarantined: the active version keeps serving, and a normal drain is
+        still allowed to wait for real completion.  All outstanding work items
+        of that version are settled as ``"quarantined"`` in one critical
+        section, so each caller fails explicitly and no request can be settled
+        twice.
+
+        The slot is **not** freed here and the in-flight count is **not**
+        zeroed: if the emergency stop cannot be confirmed, the ordinary drain
+        gate must keep waiting for the real completion.  ``release_slot`` only
+        succeeds with ``process_exited=True``; callers that could not confirm
+        exit use :meth:`abort_quarantine` instead.
+        """
+        with self._lock:
+            info = self._versions.get(version)
+            if info is None:
+                raise UnknownVersion(f"unknown version {version!r}")
+            if info["state"] != VERSION_RETIRED:
+                raise QuarantineConflict(
+                    f"version {version!r} is {info['state']!r}, not a retired "
+                    "(draining) version; only a draining version can be quarantined"
+                )
+            slot = self._slots.get(info["slot_id"])
+            if slot is None or slot["version"] != version:
+                raise QuarantineConflict(
+                    f"version {version!r} no longer owns its slot"
+                )
+            if slot["process_state"] != STATE_DRAINING:
+                raise QuarantineConflict(
+                    f"version {version!r} is not draining (slot is "
+                    f"{slot['process_state']!r})"
+                )
+            already = info.get("quarantine_state") in (
+                QUARANTINE_PENDING,
+                QUARANTINE_RELEASED,
+            )
+            now = time.time()
+            abandoned = 0
+            abandoned_tokens: list[str] = []
+            if not already:
+                info = dict(info)
+                info.update(
+                    quarantine_state=QUARANTINE_PENDING,
+                    quarantine_reason=reason,
+                    quarantined_at=now,
+                )
+                self._versions[version] = info
+                slot = dict(slot)
+                slot["quarantine_state"] = QUARANTINE_PENDING
+                self._slots[info["slot_id"]] = slot
+                for token in list(self._work.keys()):
+                    work = self._work.get(token)
+                    if work is None or work["settled"] or work["version"] != version:
+                        continue
+                    if int(work["generation"]) != int(slot["generation"]):
+                        continue
+                    work = dict(work)
+                    work.update(
+                        settled=True,
+                        outcome="quarantined",
+                        settled_at=now,
+                        late_completion=False,
+                    )
+                    self._work[token] = work
+                    abandoned += 1
+                    abandoned_tokens.append(token)
+                if abandoned:
+                    slot = dict(self._slots[info["slot_id"]])
+                    slot["abandoned"] = int(slot.get("abandoned", 0)) + abandoned
+                    self._slots[info["slot_id"]] = slot
+                info = dict(self._versions.get(version))
+                info["abandoned_work"] = int(info.get("abandoned_work", 0)) + abandoned
+                self._versions[version] = info
+            current_slot = self._slots[info["slot_id"]]
+            return {
+                "version": version,
+                "slot_id": info["slot_id"],
+                "quarantine_state": info["quarantine_state"],
+                "reason": info.get("quarantine_reason"),
+                "quarantined_at": info.get("quarantined_at"),
+                "abandoned_work": int(info.get("abandoned_work", 0)),
+                "in_flight": int(current_slot["in_flight"]),
+                "already": already,
+                "abandoned_tokens": abandoned_tokens,
+            }
+
+    def abort_quarantine(self, version: str, error: str) -> Dict[str, Any]:
+        """Record that the emergency isolation could not be carried through.
+
+        The slot is left occupied and the work accounting reverts to normal
+        drain semantics: requests the caller already saw fail stay settled
+        (and any response that arrived late is counted as completed exactly
+        once), while work that is genuinely still running becomes pending
+        again so the ordinary drain gate waits for it.
+        """
+        with self._lock:
+            info = self._versions.get(version)
+            if info is None:
+                raise UnknownVersion(f"unknown version {version!r}")
+            info = dict(info)
+            info.update(
+                quarantine_state=QUARANTINE_FAILED,
+                error=error,
+            )
+            self._versions[version] = info
+            slot = self._slots.get(info["slot_id"])
+            if slot is not None and slot["version"] == version:
+                slot = dict(slot)
+                slot["quarantine_state"] = QUARANTINE_FAILED
+                restored = 0
+                reclaimed = 0
+                for token in list(self._work.keys()):
+                    work = self._work.get(token)
+                    if (
+                        work is None
+                        or work["version"] != version
+                        or work.get("outcome") != "quarantined"
+                        or int(work["generation"]) != int(slot["generation"])
+                    ):
+                        continue
+                    work = dict(work)
+                    if work.get("late_completion"):
+                        # The worker call already returned during the failed
+                        # emergency window; settle it now, exactly once.
+                        work.update(
+                            settled=True,
+                            outcome="completed",
+                            settled_at=time.time(),
+                        )
+                        self._work[token] = work
+                        slot["in_flight"] = max(0, slot["in_flight"] - 1)
+                        slot["completed"] += 1
+                        reclaimed += 1
+                    else:
+                        work.update(settled=False, outcome=None, late_completion=False)
+                        self._work[token] = work
+                        restored += 1
+                # Work that was only provisionally abandoned and is still
+                # genuinely running is no longer "abandoned": the normal drain
+                # owns it again.
+                slot["abandoned"] = max(0, int(slot.get("abandoned", 0)) - restored)
+                self._slots[info["slot_id"]] = slot
+                info["abandoned_work"] = max(
+                    0, int(info.get("abandoned_work", 0)) - restored
+                )
+                self._versions[version] = info
+            return {
+                "version": version,
+                "slot_id": info["slot_id"],
+                "quarantine_state": QUARANTINE_FAILED,
+                "error": error,
+                "in_flight": int(self._slots[info["slot_id"]]["in_flight"]),
+            }
+
+    def mark_quarantine_released(self, version: str) -> None:
         with self._lock:
             info = self._versions.get(version)
             if info is None:
                 return
-            slot = self._slots.get(info["slot_id"])
-            if slot is None or slot["version"] != version:
-                return
-            slot = dict(slot)
-            slot["in_flight"] = max(0, slot["in_flight"] - 1)
-            slot["completed"] += 1
-            self._slots[info["slot_id"]] = slot
+            info = dict(info)
+            info["quarantine_state"] = QUARANTINE_RELEASED
+            self._versions[version] = info
 
     def release_slot(self, slot_id: str, version: str, process_exited: bool) -> bool:
         """Free a drained slot.
@@ -421,8 +716,15 @@ class Registry:
             slot = self._slots.get(slot_id)
             if slot is None or slot["version"] != version:
                 return False
+            quarantined = slot.get("quarantine_state") == QUARANTINE_PENDING
             if slot["in_flight"] != 0:
-                return False
+                # Every counted request may be settled at most once.  For a
+                # quarantined version the work was already explicitly settled,
+                # so a non-zero counter is stale bookkeeping rather than real
+                # work -- and the process is confirmed gone.  A normal drain,
+                # by contrast, must keep waiting for the real completion.
+                if not quarantined:
+                    return False
             if slot["process_state"] not in (STATE_DRAINING, STATE_LOADING):
                 return False
             slot = dict(slot)
@@ -430,13 +732,22 @@ class Registry:
                 version=None,
                 process_state=STATE_IDLE,
                 pid=None,
+                in_flight=0,
                 idle_since=time.time(),
             )
+            # A quarantined version's marker must survive into the idle slot so
+            # status queries can still report it.
+            if slot.get("quarantine_state") == QUARANTINE_PENDING:
+                slot["quarantine_state"] = QUARANTINE_RELEASED
             self._slots[slot_id] = slot
             info = self._versions.get(version)
             if info is not None:
                 info = dict(info)
                 info["process_state"] = STATE_IDLE
+                if info.get("quarantine_state") == QUARANTINE_PENDING:
+                    info["quarantine_state"] = QUARANTINE_RELEASED
+                # A failed quarantine stays visible in status as "failed" after
+                # the normal drain finally releases the slot.
                 self._versions[version] = info
             return True
 
@@ -490,6 +801,17 @@ class Registry:
             slot["completed"] += slot["in_flight"]
             slot["in_flight"] = 0
             self._slots[info["slot_id"]] = slot
+            # Mark the outstanding work items settled so a late response can
+            # never settle them a second time.
+            for token in list(self._work.keys()):
+                work = self._work.get(token)
+                if work is None or work["settled"] or work["version"] != version:
+                    continue
+                if int(work["generation"]) != int(slot["generation"]):
+                    continue
+                work = dict(work)
+                work.update(settled=True, outcome="worker_died", settled_at=time.time())
+                self._work[token] = work
             return True
 
 
